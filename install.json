@@ -1,6 +1,6 @@
 {
   "name": "CPA-X",
-  "version": "2.2.1",
+  "version": "2.3.0",
   "description": "CLIProxyAPI 管理面板",
   "language": "python",
   "entrypoint": "app.py",
