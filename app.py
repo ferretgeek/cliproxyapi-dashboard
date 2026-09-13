@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-CPA-X 管理面板后端 v2.2.1
+CPA-X 管理面板后端 v2.3.0
 功能: 为 CLIProxyAPI 提供监控统计、健康检查、资源监控、配置管理、API测试、模型管理
 优化: 缓存机制、预编译正则、非阻塞监控、减少shell调用
 """
@@ -36,7 +36,7 @@ from requests.adapters import HTTPAdapter
 
 # 面板自身版本（与 GitHub Release/README 同步）
 PANEL_NAME = "CPA-X"
-PANEL_VERSION = "2.2.1"
+PANEL_VERSION = "2.3.0"
 PRICING_BASIS_TOKENS = 1_000_000
 PRICING_BASIS_LABEL = '百万Tokens'
 PRICING_BASIS_TEXT = f'美元/{PRICING_BASIS_LABEL}'
@@ -144,6 +144,10 @@ CONFIG = {
     'panel_access_key': '',
     # 逗号分隔的跨域来源；留空时仅允许浏览器同源访问。
     'cors_origins': '',
+    # auto detects Docker/remote/systemd; monitoring never requires host privileges.
+    'deployment_mode': 'auto',
+    'settings_path': os.path.join(DATA_DIR, 'panel_settings.json'),
+    'log_scan_budget_mb': 4,
 }
 
 ENV_PREFIX = 'CLIPROXY_PANEL_'
@@ -161,6 +165,7 @@ CONFIG_TYPES = {
     'backup_max_age_days': int,
     'backup_max_total_mb': int,
     'log_initial_scan_max_mb': int,
+    'log_scan_budget_mb': int,
     'log_clear_enabled': bool,
     'update_require_checksum': bool,
     'config_write_enabled': bool,
@@ -415,6 +420,20 @@ def _load_json_file_limited(path, max_bytes):
 
 
 def _update_dotenv_values(updates):
+    # Container writable layer is ephemeral. Persist UI settings on the data
+    # volume; explicit nonempty environment variables remain authoritative.
+    if str(CONFIG.get('deployment_mode')) == 'docker' or os.path.exists('/.dockerenv'):
+        try:
+            path = _resolve_panel_path(CONFIG['settings_path'])
+            with dotenv_lock:
+                saved = _load_json_file_limited(path, 64 * 1024) if os.path.isfile(path) else {}
+                if not isinstance(saved, dict):
+                    saved = {}
+                saved.update(updates)
+                _atomic_write_json(path, saved, mode=0o600)
+            return True
+        except (OSError, ValueError, TypeError):
+            return False
     env_path = os.path.join(BASE_DIR, '.env')
     try:
         env_updates = {f'{ENV_PREFIX}{key.upper()}': _format_env_value(val) for key, val in updates.items()}
@@ -482,7 +501,21 @@ def load_config_overrides():
             dotenv_overrides[key] = dotenv_raw[env_key]
 
     _apply_overrides(dotenv_overrides)
-    _apply_overrides(env_overrides)
+    settings_path = env_overrides.get('settings_path') or CONFIG['settings_path']
+    try:
+        with open(settings_path, 'rb') as handle:
+            raw = handle.read(64 * 1024 + 1)
+        if len(raw) <= 64 * 1024:
+            saved = json.loads(raw)
+            allowed = {'management_key', 'auto_update_enabled', 'idle_threshold_seconds',
+                       'auto_update_check_interval', 'pricing_input', 'pricing_output',
+                       'pricing_cache', 'pricing_auto_enabled'}
+            if isinstance(saved, dict):
+                _apply_overrides({key: value for key, value in saved.items() if key in allowed})
+    except (OSError, ValueError, TypeError):
+        pass
+    # Empty Compose placeholders must not erase persisted settings.
+    _apply_overrides({key: value for key, value in env_overrides.items() if value != ''})
 
 
 load_config_overrides()
@@ -506,8 +539,10 @@ def _set_security_headers(response):
     )
     if request.is_secure:
         response.headers.setdefault('Strict-Transport-Security', 'max-age=31536000')
-    if request.path == '/':
-        response.headers.setdefault('Cache-Control', 'no-cache')
+    if request.path.startswith('/api/'):
+        response.headers['Cache-Control'] = 'no-store'
+    elif request.path == '/' or request.path.endswith(('.js', '.css')):
+        response.headers['Cache-Control'] = 'no-cache'
     return response
 
 
@@ -639,6 +674,8 @@ def _compose_api_base_url(base_url=None, port=None):
     if parsed.username or parsed.password:
         raise ValueError('CLIProxy API base URL must not contain credentials')
 
+    if port is None and base_url is None:
+        port = CONFIG.get('cliproxy_api_port')
     selected_port = parsed.port
     if selected_port is None and port:
         selected_port = int(port)
@@ -829,6 +866,15 @@ state = {
         'last_saved_ts': 0
     },
     'log_stats_loaded': False,
+    'upstream': {},
+    'service_snapshot': None,
+    'resources_snapshot': None,
+    'logs_snapshot': {'logs': [], 'count': 0},
+    'collector_time': None,
+    'collector_error': None,
+    'version_source': 'unknown',
+    'version_checked_at': None,
+    'version_error': None,
 }
 
 log_lock = threading.Lock()
@@ -843,6 +889,10 @@ update_history_lock = threading.Lock()
 update_lock = threading.Lock()
 auto_update_wakeup = threading.Event()
 auto_update_failure_lock = threading.Lock()
+upstream_probe_lock = threading.Lock()
+version_check_lock = threading.Lock()
+shutdown_event = threading.Event()
+collector_wakeup = threading.Event()
 
 http_session = requests.Session()
 http_session.headers.update({'User-Agent': f'{PANEL_NAME}/{PANEL_VERSION}'})
@@ -965,10 +1015,10 @@ def save_persistent_stats(force=False):
 
 def _persistent_stats_worker():
     """后台线程：定期保存统计数据"""
-    while True:
-        time.sleep(30)  # 每30秒保存一次
+    while not shutdown_event.wait(30):  # 每30秒保存一次
         try:
             save_persistent_stats()
+            save_log_stats_state()
         except Exception as e:
             print(f"Warning: persistent stats worker error ({_error_kind(e)})")
 
@@ -1104,6 +1154,8 @@ def _reset_management_auth_state():
     cache.invalidate('local_version_mgmt')
     cache.invalidate('local_version')
     cache.invalidate('health_check')
+    state['upstream'] = {}
+    collector_wakeup.set()
 
 
 def _record_management_auth_success():
@@ -1778,6 +1830,8 @@ def get_system_info():
 
 
 def get_cliproxy_process_usage():
+    if not get_capabilities()['service_control']:
+        return {'available': False, 'cpu_percent': None, 'memory_bytes': None, 'memory_percent': None}
     if not HAS_PSUTIL:
         return {'cpu_percent': 0.0, 'memory_bytes': 0, 'memory_percent': 0.0}
     monitor = globals().get('resource_monitor')
@@ -1919,7 +1973,7 @@ class ResourceMonitor:
 
     def _sample_cliproxy_process(self):
         empty = {'cpu_percent': 0.0, 'memory_bytes': 0, 'memory_percent': 0.0, 'pid': None}
-        if not HAS_PSUTIL:
+        if not HAS_PSUTIL or not get_capabilities()['service_control']:
             return empty
         target = str(CONFIG.get('cliproxy_service', 'cliproxy') or 'cliproxy').lower()
         proc = self._cliproxy_process
@@ -2097,8 +2151,155 @@ def create_binary_backup(binary_path):
     return backup_path
 
 
+def get_capabilities():
+    mode = str(CONFIG.get('deployment_mode', 'auto')).lower()
+    try:
+        host, _ = _api_host_port()
+        local = host.lower() == 'localhost' or ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        local = False
+    container = os.path.exists('/.dockerenv') or os.path.exists('/run/.containerenv')
+    systemd = is_linux() and command_available('systemctl') and os.path.isdir('/run/systemd/system')
+    if mode == 'auto':
+        mode = 'docker' if container else ('systemd' if local and systemd else 'remote')
+    controllable = mode == 'systemd' and local and systemd and not container
+    return {
+        'mode': mode,
+        'service_control': controllable,
+        'binary_update': controllable,
+        'config_write': is_config_write_enabled(),
+        'reason': '' if controllable else '当前为远程 / 容器监控模式。服务启停与升级请在上游部署环境中执行。',
+        'resource_scope': 'panel_environment' if not controllable else 'host',
+    }
+
+
+def _upstream_fingerprint():
+    # Used only in memory; never expose secret-bearing identity in API payloads.
+    raw = _build_management_base_url() + '\0' + _management_headers().get('X-Management-Key', '')
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+
+def _find_version_value(value, depth=0):
+    if depth > 3:
+        return None
+    if isinstance(value, dict):
+        for key, item in value.items():
+            key_text = str(key).lower().replace('_', '-').replace(' ', '-')
+            if key_text in {'version', 'cpa-version', 'cli-proxy-api-version', 'build-version', 'release', 'commit', 'commit-sha', 'git-commit'} and isinstance(item, (str, int, float)):
+                candidate = str(item).strip()
+                if _is_semver_like(candidate) or HASH_VERSION_PATTERN.fullmatch(candidate):
+                    return candidate
+            # Do not accidentally use a configured provider/client version.
+            if key_text in {'build', 'build-info', 'server', 'metadata'}:
+                found = _find_version_value(item, depth + 1)
+                if found:
+                    return found
+    return None
+
+
+def probe_upstream(force=False):
+    """Single-flight, bounded probe; version is read from headers or config JSON."""
+    identity = _upstream_fingerprint()
+    previous = state.get('upstream', {})
+    now = time.monotonic()
+    if previous.get('_identity') == identity and now < previous.get('_next_probe', 0) and not force:
+        return previous
+    if not upstream_probe_lock.acquire(blocking=False):
+        return previous
+    try:
+        previous = state.get('upstream', {})
+        if previous.get('_identity') != identity:
+            previous = {}
+        elif not force and time.monotonic() < previous.get('_next_probe', 0):
+            return previous
+        result = {
+            'available': False, 'reachable': False, 'status': 'unreachable',
+            'http_status': None, 'version': previous.get('version', 'unknown'),
+            'version_source': previous.get('version_source', 'unknown'),
+            'version_stale': True, 'checked_at': _utc_iso(),
+            'commit': previous.get('commit'), 'build_date': previous.get('build_date'),
+            'last_success_at': previous.get('last_success_at'),
+            'message': '无法连接上游，请检查容器网络、地址和端口。',
+            '_identity': identity,
+        }
+        if _management_auth_locked():
+            result.update(status='auth_required', message='管理接口认证已暂停，请重新保存正确的管理密钥。')
+        else:
+            response = None
+            try:
+                response = http_session.get(
+                    _build_management_base_url() + '/v0/management/config',
+                    headers=_management_headers(), timeout=(2, 3),
+                    stream=True, allow_redirects=False,
+                )
+                if _upstream_fingerprint() != identity:
+                    return state.get('upstream', {})
+                _observe_management_response(response)
+                code = response.status_code
+                result.update(reachable=True, http_status=code)
+                # Header names are case insensitive even for simple test adapters.
+                headers = {str(k).lower(): str(v).strip() for k, v in response.headers.items()}
+                version = (headers.get('x-cpa-version') or headers.get('x-cliproxy-version')
+                           or headers.get('x-cli-proxy-api-version') or headers.get('x-version') or '')
+                result['commit'] = headers.get('x-cpa-commit', '')[:80] or None
+                result['build_date'] = headers.get('x-cpa-build-date', '')[:80] or None
+                payload = None
+                if code == 200 and not version:
+                    try:
+                        payload = _response_json_limited(response, 256 * 1024)
+                    except (OSError, ValueError, TypeError):
+                        payload = None
+                    version = _find_version_value(payload) or ''
+                if _is_semver_like(version) or version.lower() == 'dev' or HASH_VERSION_PATTERN.fullmatch(version):
+                    source = 'management_header' if headers.get('x-cpa-version') or headers.get('x-cliproxy-version') or headers.get('x-cli-proxy-api-version') or headers.get('x-version') else 'management_payload'
+                    result.update(version=_decorate_version_tag(version), version_source=source, version_stale=False)
+                if code == 200:
+                    result.update(available=True, status='running', last_success_at=_utc_iso(),
+                                  message='管理接口可用' if not result['version_stale'] else '管理接口可用，但未提供可识别的版本响应头。')
+                elif code in (401, 403):
+                    result.update(status='auth_required', message='上游可连接，但拒绝管理密钥；检查密钥及 allow-remote 配置。')
+                elif code == 404:
+                    result.update(status='not_found', message='上游未开放管理接口；检查管理密钥、API 基址与反向代理路径。')
+                else:
+                    result.update(status='upstream_error', message=f'管理接口返回 HTTP {code}，请检查上游服务。')
+            except requests.RequestException:
+                pass
+            finally:
+                if response is not None:
+                    response.close()
+        failures = 0 if result['available'] else min(6, int(previous.get('_failures', 0)) + 1)
+        result['_failures'] = failures
+        result['_next_probe'] = time.monotonic() + (10 if not failures else min(120, 5 * 2 ** failures))
+        # Discard a response if the operator changed credentials during the request.
+        if _upstream_fingerprint() != identity:
+            return state.get('upstream', {})
+        state['upstream'] = result
+        return result
+    finally:
+        upstream_probe_lock.release()
+
+
+def upstream_snapshot():
+    snapshot = {key: value for key, value in state.get('upstream', {}).items() if not key.startswith('_')}
+    snapshot.setdefault('status', 'checking')
+    snapshot.setdefault('message', '正在等待首次连接检查')
+    checked = _parse_iso_datetime(snapshot.get('checked_at'))
+    snapshot['stale'] = not checked or (_utc_now() - checked).total_seconds() > 150
+    return snapshot
+
+
 def get_service_status(use_cache=True):
-    """获取服务状态（带缓存）"""
+    """Local systemd status, or explicit remote management reachability."""
+    if not get_capabilities()['service_control']:
+        remote = upstream_snapshot()
+        stale = remote.get('stale', True)
+        return {
+            'running': bool(remote.get('available')) and not stale,
+            'status': 'unknown' if stale else remote.get('status', 'checking'),
+            'pid': None, 'memory': 'N/A', 'cpu': 'N/A', 'uptime': 'N/A',
+            'details': remote.get('message'), 'source': 'management_api',
+            'checked_at': remote.get('checked_at'), 'stale': stale,
+        }
     cache_key = 'service_status'
     if use_cache:
         cached = cache.get(cache_key, max_age=1)
@@ -2112,12 +2313,12 @@ def get_service_status(use_cache=True):
     if is_linux() and command_available('systemctl'):
         service_name = _systemd_service_name()
         if service_name:
-            success, stdout, _ = run_cmd(['systemctl', 'is-active', service_name])
+            success, stdout, _ = run_cmd(['systemctl', 'is-active', service_name], timeout=3)
             is_running = success and stdout == 'active'
-            _, full_status, _ = run_cmd(['systemctl', 'status', service_name, '--no-pager', '-l'])
+            _, full_status, _ = run_cmd(['systemctl', 'status', service_name, '--no-pager', '-l'], timeout=3)
             status_out = '\n'.join(full_status.splitlines()[:20])
             # 尽量用 systemd 的 MainPID（比 pgrep 更准确，且不依赖进程名）
-            ok_pid, pid_value, _ = run_cmd(['systemctl', 'show', service_name, '-p', 'MainPID', '--value'])
+            ok_pid, pid_value, _ = run_cmd(['systemctl', 'show', service_name, '-p', 'MainPID', '--value'], timeout=3)
             if ok_pid:
                 pid_value = (pid_value or '').strip()
                 if pid_value and pid_value != '0':
@@ -2128,7 +2329,7 @@ def get_service_status(use_cache=True):
         status_out = 'Not supported on this platform'
 
     # fallback：没有 systemd 或无法获取 MainPID 时再尝试 pgrep
-    if not pid_out and command_available('pgrep'):
+    if is_running and not pid_out and command_available('pgrep'):
         _, all_pids, _ = run_cmd(['pgrep', '-f', 'cli-proxy-api|cliproxyapi|cliproxy'])
         pid_out = next((line.strip() for line in all_pids.splitlines() if line.strip()), '')
 
@@ -2162,7 +2363,10 @@ def get_service_status(use_cache=True):
         'memory': memory,
         'cpu': cpu,
         'uptime': uptime,
-        'details': status_out
+        'details': status_out,
+        'source': 'systemd',
+        'checked_at': _utc_iso(),
+        'stale': False,
     }
 
     cache.set(cache_key, result)
@@ -2335,32 +2539,11 @@ def _cliproxy_management_get(path, timeout=6):
 
 
 def _get_local_version_from_management():
-    """优先从 CLIProxyAPI 管理接口响应头读取版本号（适用于二进制安装）"""
-    cache_key = 'local_version_mgmt'
-    cached = cache.get(cache_key, max_age=10)
-    if cached:
-        return cached
-
-    resp = _cliproxy_management_get('/v0/management/config', timeout=5)
-    if resp is None:
-        return None
-    try:
-        if resp.status_code != 200:
-            return None
-        header_value = resp.headers.get('X-Cpa-Version') or resp.headers.get('X-CPA-VERSION')
-        if not header_value:
-            return None
-        version = _decorate_version_tag(header_value)
-        # 避免把上游的 dev/unknown 当成“可用版本”
-        if _normalize_release_version(version) in {'unknown', 'dev', ''}:
-            return None
-        if version:
-            cache.set(cache_key, version)
-            return version
-    except Exception:
-        return None
-    finally:
-        resp.close()
+    snapshot = probe_upstream()
+    version = snapshot.get('version')
+    if version and version != 'unknown':
+        state['version_source'] = snapshot.get('version_source', 'management_header')
+        return version
     return None
 
 
@@ -2404,7 +2587,7 @@ def _get_last_successful_release_version_from_history():
 def get_local_version():
     """获取本地版本号"""
     cache_key = 'local_version'
-    cached = cache.get(cache_key, max_age=300)
+    cached = cache.get(cache_key, max_age=15)
     if cached is not None:
         return cached
 
@@ -2417,7 +2600,14 @@ def get_local_version():
         if _is_semver_like(mgmt_version):
             cache.set(cache_key, mgmt_version)
             return mgmt_version
-        mgmt_candidate = mgmt_version
+        # A dev build is honest information, not a reason to invent a release.
+        cache.set(cache_key, mgmt_version)
+        return mgmt_version
+
+    if not get_capabilities()['binary_update']:
+        state['version_source'] = 'unknown'
+        cache.set(cache_key, 'unknown')
+        return 'unknown'
 
     # 2) 其次：本地 git 仓库
     cliproxy_dir = _resolve_panel_path(CONFIG.get('cliproxy_dir'))
@@ -2434,7 +2624,7 @@ def get_local_version():
             except Exception:
                 pass
 
-        ok, stdout, _ = run_cmd(['git', 'describe', '--tags', '--abbrev=0'], cwd=cliproxy_dir)
+        ok, stdout, _ = run_cmd(['git', 'describe', '--tags', '--exact-match'], cwd=cliproxy_dir, timeout=3)
         if ok and stdout and _is_semver_like(stdout):
             decorated = _decorate_version_tag(stdout)
             cache.set(cache_key, decorated)
@@ -2444,11 +2634,8 @@ def get_local_version():
         if ok and stdout:
             mgmt_candidate = mgmt_candidate or stdout
 
-    # 3) 兜底：如果上游/本地无法得到 release 版本号，尝试从更新历史中读取
-    history_version = _get_last_successful_release_version_from_history()
-    if history_version:
-        cache.set(cache_key, history_version)
-        return history_version
+    # Update history is not proof of the binary currently deployed.
+    # Never replace an unknown current version with a previous successful release.
 
     # 4) 再兜底：如果管理接口返回了 hash 等信息，至少返回它；否则 unknown
     if mgmt_candidate:
@@ -2511,26 +2698,20 @@ def _reset_log_stats_state(*, start_at_end=False):
 
 
 def read_log_tail(log_file, max_lines=100, chunk_size=4096):
-    """尾部读取日志，避免全量读取"""
-    if not os.path.exists(log_file):
-        return []
+    """Bounded O(n) tail: even a file with no newline cannot consume unbounded RAM."""
     if max_lines <= 0:
         return []
-
     try:
-        with open(log_file, 'rb') as f:
-            f.seek(0, os.SEEK_END)
-            file_size = f.tell()
-            remaining = file_size
-            data = b''
-            while remaining > 0 and data.count(b'\n') <= max_lines:
-                read_size = chunk_size if remaining >= chunk_size else remaining
-                remaining -= read_size
-                f.seek(remaining)
-                data = f.read(read_size) + data
-            text = data.decode('utf-8', errors='ignore')
-            return text.splitlines()[-max_lines:]
-    except Exception:
+        with open(log_file, 'rb') as handle:
+            handle.seek(0, os.SEEK_END)
+            offset = max(0, handle.tell() - 1024 * 1024)
+            handle.seek(offset)
+            data = handle.read(1024 * 1024)
+        lines = data.splitlines()
+        if offset and lines:
+            lines = lines[1:]  # first line may have been cut at the byte boundary
+        return [line[:16 * 1024].decode('utf-8', errors='replace') for line in lines[-min(max_lines, 1000):]]
+    except (OSError, ValueError):
         return []
 
 
@@ -2625,22 +2806,30 @@ def get_request_count_from_logs():
 
         try:
             with open(log_file, 'rb') as f:
-                if offset:
-                    f.seek(offset)
-                    if log_state.get('partial') and offset == log_state.get('skipped_bytes'):
-                        # The bounded first scan may begin in the middle of a line.
-                        f.readline()
+                f.seek(offset)
+                if rotated:
+                    log_state['discarding_line'] = bool(offset)
                 new_offset = f.tell()
-                while True:
+                budget = max(1, min(16, _safe_int(CONFIG.get('log_scan_budget_mb'), 4))) * 1024 * 1024
+                deadline = time.monotonic() + 0.05
+                while f.tell() - offset < budget and time.monotonic() < deadline:
                     line_start = f.tell()
-                    raw_line = f.readline()
+                    raw_line = f.readline(64 * 1024)
                     if not raw_line:
                         break
-                    # Leave an incomplete trailing line for the next pass.
+                    new_offset = f.tell()
+                    if log_state.get('discarding_line'):
+                        log_state['discarding_line'] = not raw_line.endswith(b'\n')
+                        continue
                     if not raw_line.endswith(b'\n'):
+                        if len(raw_line) == 64 * 1024:
+                            log_state['discarding_line'] = True
+                            log_state['partial'] = True
+                            log_state['skipped_bytes'] += len(raw_line)
+                            continue
+                        # Preserve a normal incomplete trailing line for the next scan.
                         new_offset = line_start
                         break
-                    new_offset = f.tell()
                     line = raw_line.decode('utf-8', errors='replace')
                     time_match = LOG_TIME_PATTERN.search(line)
                     if time_match:
@@ -2696,6 +2885,7 @@ def get_request_count_from_logs():
 
         log_state['initialized'] = True
         log_state['offset'] = new_offset
+        log_state['catching_up'] = new_offset < file_size
         log_state['last_size'] = file_size
         log_state['last_mtime'] = mtime
         log_state['file_identity'] = file_identity
@@ -2711,6 +2901,7 @@ def get_request_count_from_logs():
             'success': _safe_int(log_state.get('base_success', 0)) + _safe_int(log_state.get('success', 0)),
             'failed': _safe_int(log_state.get('base_failed', 0)) + _safe_int(log_state.get('failed', 0)),
             'log_available': True,
+            'catching_up': bool(log_state.get('catching_up', False)),
             'partial': bool(log_state.get('partial', False)),
             'skipped_bytes': _safe_int(log_state.get('skipped_bytes', 0)),
             'timezone': {
@@ -2901,6 +3092,8 @@ def _clear_failure_for_new_release(latest_version):
 def check_for_updates(use_cache=True, *, allow_network=True):
     """检查更新（使用GitHub releases）"""
     cache_key = 'update_check_details'
+    if not allow_network:
+        return bool(state.get('has_update', False))
     if use_cache:
         cached = cache.get(cache_key, max_age=60)
         if cached is not None:
@@ -2925,8 +3118,8 @@ def check_for_updates(use_cache=True, *, allow_network=True):
     current_key = _release_version_key(current_display)
     latest_key = _release_version_key(latest_display)
     if current_key is not None and latest_key is not None:
-        result = latest_key > current_key
-    elif _is_git_repo(_resolve_panel_path(CONFIG.get('cliproxy_dir'))) and command_available('git'):
+        result = latest_key > current_key and not upstream_snapshot().get('version_stale', False)
+    elif get_capabilities()['binary_update'] and _is_git_repo(_resolve_panel_path(CONFIG.get('cliproxy_dir'))) and command_available('git'):
         current_commit = get_current_commit()
         latest_commit = get_latest_commit()
         result = (
@@ -2970,6 +3163,10 @@ def get_idle_state(stats=None):
         'timezone': stats.get('timezone') if isinstance(stats, dict) else None,
     }
 
+    if not result['log_available'] or stats.get('catching_up'):
+        result.update(is_idle=False, reason='log_catching_up' if stats.get('catching_up') else 'log_unavailable', idle_wait_seconds=None)
+        return result
+
     if not last_time_str:
         if not result['log_available']:
             # Missing activity data is not proof of idleness. Staying busy here
@@ -2998,7 +3195,7 @@ def get_idle_state(stats=None):
         result['idle_for_seconds'] = idle_seconds
         result['idle_wait_seconds'] = idle_wait_seconds
         result['clock_skew_seconds'] = max(0, -elapsed)
-        result['is_idle'] = idle_wait_seconds == 0
+        result['is_idle'] = idle_wait_seconds == 0 and elapsed >= 0
         result['reason'] = 'threshold_reached' if result['is_idle'] else ('clock_skew' if elapsed < 0 else 'recent_request')
         return result
     except (TypeError, ValueError, OverflowError):
@@ -3031,7 +3228,10 @@ def get_auto_update_state(has_update=None, stats=None):
 
     summary = '等待状态更新'
     phase = 'unknown'
-    if not state.get('auto_update_enabled', False):
+    if not get_capabilities()['binary_update']:
+        phase = 'unsupported'
+        summary = '监控模式：升级由部署环境管理'
+    elif not state.get('auto_update_enabled', False):
         phase = 'disabled'
         summary = '自动更新已关闭'
     elif state.get('update_in_progress'):
@@ -3040,9 +3240,12 @@ def get_auto_update_state(has_update=None, stats=None):
     elif _normalize_release_version(state.get('latest_version')) in {'', 'unknown'}:
         phase = 'checking'
         summary = '正在检查最新版本'
+    elif _release_version_key(state.get('current_version')) is None or upstream_snapshot().get('version_stale'):
+        phase = 'unknown_version'
+        summary = '当前版本无法可靠比较'
     elif not has_update:
         phase = 'no_update'
-        summary = '已是最新版本'
+        summary = '未发现更高版本'
     elif failure_state['retry_in_seconds'] > 0:
         phase = 'backoff'
         summary = f'上次更新失败，{format_uptime(failure_state["retry_in_seconds"])}后自动重试'
@@ -3136,8 +3339,8 @@ def perform_update(*, lock_acquired=False):
     cliproxy_dir = _resolve_panel_path(CONFIG.get('cliproxy_dir'))
 
     try:
-        if not (is_linux() and command_available('systemctl')):
-            result['message'] = 'Update only supported on Linux with systemd'
+        if not get_capabilities()['binary_update']:
+            result['message'] = 'Update only supported for a local Linux systemd deployment'
             return False, result
         if not service_name:
             result['message'] = 'Service name is missing or invalid'
@@ -3624,14 +3827,22 @@ def auto_update_worker():
         first_check = False
         state['next_auto_update_check_monotonic'] = time.monotonic() + wait_seconds
         state['next_auto_update_check_time'] = _utc_iso(_utc_now() + timedelta(seconds=wait_seconds))
-        if auto_update_wakeup.wait(wait_seconds):
-            auto_update_wakeup.clear()
-            continue
+        auto_update_wakeup.wait(wait_seconds)
+        auto_update_wakeup.clear()
         state['next_auto_update_check_monotonic'] = None
         state['last_auto_update_check_time'] = _utc_iso()
 
-        if not state['auto_update_enabled']:
-            print(f'[{_utc_iso()}] Auto-update skipped: disabled')
+        # Version discovery must remain active even when upgrades are disabled.
+        if shutdown_event.is_set():
+            return
+        try:
+            with version_check_lock:
+                check_for_updates(use_cache=False)
+                state['version_checked_at'] = _utc_iso()
+                state['version_error'] = None if _is_semver_like(state['latest_version']) else '暂时无法访问 GitHub 更新源'
+        except Exception as exc:
+            state['version_error'] = f'版本检查失败 ({_error_kind(exc)})'
+        if not state['auto_update_enabled'] or not get_capabilities()['binary_update']:
             continue
 
         if state['update_in_progress']:
@@ -3639,7 +3850,7 @@ def auto_update_worker():
             continue
 
         try:
-            has_update = check_for_updates(use_cache=False)
+            has_update = bool(state.get('has_update'))
             if not has_update:
                 print(f'[{_utc_iso()}] Auto-update check: no new release')
                 continue
@@ -3713,12 +3924,12 @@ def parse_log_file(log_file, max_lines=100, limit=None):
 def parse_journal_logs(service_name, max_lines=100):
     """读取 systemd journal，补齐 CLIProxyAPI 后台日志"""
     service_name = _systemd_service_name(service_name)
-    if not service_name or not is_linux() or not command_available('journalctl'):
+    if not service_name or not get_capabilities()['service_control'] or not command_available('journalctl'):
         return []
 
     ok, stdout, _ = run_cmd(
         ['journalctl', '-u', str(service_name), '-n', str(int(max_lines)), '--no-pager', '-o', 'json'],
-        timeout=20,
+        timeout=3,
     )
     if not ok or not stdout:
         return []
@@ -4132,8 +4343,8 @@ def perform_health_check(use_cache=True):
     service = get_service_status()
     service_check = {
         'name': '服务状态',
-        'status': 'pass' if service['running'] else 'fail',
-        'message': '服务运行中' if service['running'] else '服务未运行',
+        'status': 'pass' if service['running'] else ('warn' if service.get('status') in {'unknown', 'checking'} else 'fail'),
+        'message': ('服务运行中' if service['running'] else '服务未运行') if service.get('source') != 'management_api' else service.get('details', '管理接口状态未知'),
         'details': service
     }
     results['checks'].append(service_check)
@@ -4141,9 +4352,10 @@ def perform_health_check(use_cache=True):
 
     # 2. 配置文件检查
     config, error = load_cliproxy_config()
+    remote_mode = not get_capabilities()['service_control']
     config_check = {
-        'name': '配置文件',
-        'status': 'pass' if config is not None else 'fail',
+        'name': '配置文件（可选挂载）' if remote_mode else '配置文件',
+        'status': 'pass' if config is not None else ('warn' if remote_mode else 'fail'),
         'message': '配置文件有效' if config is not None else f'配置错误: {error}'
     }
     results['checks'].append(config_check)
@@ -4153,7 +4365,7 @@ def perform_health_check(use_cache=True):
         usage_check = {
             'name': '用量统计',
             'status': 'warn',
-            'message': 'CLIProxyAPI 已关闭 usage-statistics-enabled；v7 用量队列不会产生 Token 记录',
+            'message': '上游用量统计已关闭；本面板仅展示已保存的 Token 历史，实时请求来自日志。',
         }
         results['checks'].append(usage_check)
         results['checks_map']['usage_statistics'] = usage_check
@@ -4335,8 +4547,8 @@ def perform_health_check(use_cache=True):
     else:
         auth_check = {
             'name': '认证文件',
-            'status': 'fail',
-            'message': '认证目录不存在'
+            'status': 'warn' if remote_mode else 'fail',
+            'message': '未挂载认证目录（可选能力）' if remote_mode else '认证目录不存在'
         }
         results['checks'].append(auth_check)
         results['checks_map']['auth'] = auth_check
@@ -4530,8 +4742,7 @@ def request_too_large(_error):
         return jsonify({'success': False, 'error': 'Request body exceeds the 3 MiB limit'}), 413
     return 'Request body too large', 413
 
-@app.route('/api/status')
-def api_status():
+def build_status_payload():
     service = get_service_status()
     has_update = check_for_updates(allow_network=False)
     log_requests = get_request_count_from_logs()
@@ -4563,8 +4774,7 @@ def api_status():
     billable_input_tokens = get_billable_input_tokens(display_token_totals)
     usage_costs = compute_usage_costs(display_token_totals, pricing)
 
-    # 触发持久化保存
-    save_persistent_stats()
+    # Persistence is performed by the background worker, never by dashboard polling.
 
     # 如果没有从 API 获取到请求数，使用日志统计
     has_usage_requests = display_total_requests > 0
@@ -4574,7 +4784,7 @@ def api_status():
     idle_state = get_idle_state(log_requests)
     auto_update_state = get_auto_update_state(has_update=has_update, stats=log_requests)
 
-    return jsonify({
+    return {
         'panel': {
             'name': PANEL_NAME,
             'version': f'v{PANEL_VERSION}',
@@ -4583,8 +4793,14 @@ def api_status():
         'version': {
             'current': state['current_version'],
             'latest': state['latest_version'],
-            'has_update': has_update
+            'has_update': has_update,
+            'source': state.get('version_source', 'unknown'),
+            'stale': upstream_snapshot().get('version_stale', False),
+            'checked_at': state.get('version_checked_at'),
+            'error': state.get('version_error'),
         },
+        'capabilities': get_capabilities(),
+        'upstream': upstream_snapshot(),
         'requests': {
             'count': final_count,
             'last_time': log_requests.get('last_time'),
@@ -4600,6 +4816,7 @@ def api_status():
             'timezone': log_requests.get('timezone'),
             'log_available': bool(log_requests.get('log_available', False)),
             'log_partial': bool(log_requests.get('partial', False)),
+            'log_catching_up': bool(log_requests.get('catching_up', False)),
             'log_skipped_bytes': _safe_int(log_requests.get('skipped_bytes', 0)),
             'idle_reason': idle_state.get('reason'),
         },
@@ -4627,7 +4844,27 @@ def api_status():
             'live': bool(snapshot_meta.get('live')),
             'fetched_at': snapshot_meta.get('fetched_at'),
         },
+    }
+
+
+@app.route('/api/status')
+def api_status():
+    payload = dict(state.get('dashboard_snapshot') or {
+        'panel': {'name': PANEL_NAME, 'version': f'v{PANEL_VERSION}'},
+        'service': {'running': False, 'status': 'checking', 'source': 'unknown'},
+        'version': {'current': 'unknown', 'latest': 'unknown', 'has_update': False},
+        'requests': {}, 'update': {}, 'config': {'write_enabled': is_config_write_enabled()},
+        'health': 'unknown', 'capabilities': get_capabilities(),
+        'upstream': {'status': 'checking', 'message': '正在收集首次状态'},
     })
+    collected = _parse_iso_datetime(state.get('collector_time'))
+    age = max(0, (_utc_now() - collected).total_seconds()) if collected else None
+    payload['collection'] = {'at': state.get('collector_time'), 'age_seconds': age,
+                             'stale': age is None or age > 30, 'error': state.get('collector_error')}
+    if payload['collection']['stale']:
+        payload['service'] = {**payload['service'], 'running': False, 'status': 'unknown', 'stale': True}
+    return jsonify(payload)
+
 
 @app.route('/api/logs')
 def api_logs():
@@ -4637,11 +4874,7 @@ def api_logs():
 @app.route('/api/cliproxy-logs')
 def api_cliproxy_logs():
     """获取 CLIProxy 完整日志"""
-    file_logs = parse_log_file(CONFIG['cliproxy_log'], max_lines=400, limit=400)
-    stderr_logs = parse_log_file(CONFIG['cliproxy_stderr'], max_lines=120, limit=120)
-    journal_logs = parse_journal_logs(CONFIG.get('cliproxy_service'), max_lines=120)
-    logs = merge_log_entries(file_logs, stderr_logs, journal_logs, limit=200)
-    return jsonify({'logs': logs, 'count': len(logs)})
+    return jsonify(state.get('logs_snapshot', {'logs': [], 'count': 0}))
 
 @app.route('/api/cliproxy-logs/clear', methods=['POST'])
 def api_clear_cliproxy_logs():
@@ -4761,6 +4994,8 @@ def api_update():
     if not isinstance(force, bool):
         return jsonify({'success': False, 'message': 'force must be a boolean'}), 400
 
+    if not get_capabilities()['binary_update']:
+        return jsonify({'success': False, 'message': get_capabilities()['reason']}), 409
     if not force and not is_idle():
         return jsonify({
             'success': False,
@@ -4789,13 +5024,19 @@ def api_service(action):
     if action not in ['start', 'stop', 'restart']:
         return jsonify({'success': False, 'message': 'Invalid action'}), 400
 
-    if not (is_linux() and command_available('systemctl')):
-        return jsonify({'success': False, 'message': 'Service control not supported on this platform'}), 400
+    if not get_capabilities()['service_control']:
+        return jsonify({'success': False, 'message': get_capabilities()['reason']}), 409
 
     service_name = _systemd_service_name()
     if not service_name:
         return jsonify({'success': False, 'message': 'Invalid or missing service name'}), 400
-    success, stdout, stderr = run_cmd(['systemctl', action, service_name])
+    if not update_lock.acquire(blocking=False):
+        return jsonify({'success': False, 'message': '升级或服务操作正在进行，请稍后重试'}), 409
+    try:
+        success, stdout, stderr = run_cmd(['systemctl', action, service_name], timeout=10)
+    finally:
+        update_lock.release()
+    collector_wakeup.set()
     cache.invalidate('service_status')
     time.sleep(2)
 
@@ -4809,6 +5050,8 @@ def api_toggle_auto_update():
         return jsonify({'success': False, 'error': 'JSON object required'}), 400
     enabled_raw = data.get('enabled', not state['auto_update_enabled'])
     enabled = enabled_raw if isinstance(enabled_raw, bool) else _parse_bool(enabled_raw)
+    if enabled and not get_capabilities()['binary_update']:
+        return jsonify({'success': False, 'error': get_capabilities()['reason']}), 409
     if not _update_dotenv_values({'auto_update_enabled': enabled}):
         return jsonify({'success': False, 'error': '保存 .env 失败'}), 500
     state['auto_update_enabled'] = enabled
@@ -4932,6 +5175,9 @@ def api_management_key():
         return jsonify({'success': False, 'error': 'CPA 管理密钥不能为空'}), 400
     if len(key) > 4096 or any(char in key for char in ('\r', '\n', '\x00')):
         return jsonify({'success': False, 'error': 'CPA 管理密钥格式无效'}), 400
+    env_key = os.environ.get('CLIPROXY_PANEL_MANAGEMENT_KEY', '').strip()
+    if get_capabilities()['mode'] == 'docker' and env_key and env_key != key:
+        return jsonify({'success': False, 'error': '密钥由容器环境变量管理，请修改部署配置并重新创建容器。'}), 409
 
     if not _update_dotenv_values({'management_key': key}):
         return jsonify({'success': False, 'error': '保存 .env 失败'}), 500
@@ -5033,14 +5279,16 @@ def api_request_history():
 
 @app.route('/api/check-update')
 def api_check_update():
-    cache.invalidate('github_release')
-    cache.invalidate('update_check_details')
-    has_update = check_for_updates(use_cache=False)
+    # Enqueue at most one check; a slow GitHub response must not occupy HTTP workers.
+    if cache.get('manual_version_check', max_age=15) is None:
+        cache.set('manual_version_check', True)
+        cache.invalidate('local_version')
+        auto_update_wakeup.set()
+        collector_wakeup.set()
     return jsonify({
-        'has_update': has_update,
-        'current': state['current_version'],
-        'latest': state['latest_version']
-    })
+        'checking': True, 'has_update': state['has_update'],
+        'current': state['current_version'], 'latest': state['latest_version'],
+    }), 202
 
 @app.route('/api/auth-files')
 def api_auth_files():
@@ -5313,15 +5561,22 @@ def api_set_routing():
 @app.route('/api/health')
 def api_health():
     """健康检查"""
-    results = perform_health_check()
-    return jsonify(results)
+    payload = dict(state.get('health_snapshot') or {
+        'overall': 'unknown', 'checks': [], 'checks_map': {}, 'pending': True,
+    })
+    checked = _parse_iso_datetime(payload.get('timestamp'))
+    payload['stale'] = not checked or (_utc_now() - checked).total_seconds() > 150
+    if payload['stale']:
+        payload['overall'] = 'unknown'
+    return jsonify(payload)
 
 @app.route('/api/resources')
 def api_resources():
-    """获取系统资源"""
-    get_request_count_from_logs()
-    resources = get_system_resources()
-    return jsonify(resources)
+    """Latest background sample; never sample process / host resources in a request."""
+    payload = dict(state.get('resources_snapshot') or {'pending': True})
+    collected = _parse_iso_datetime(payload.get('collected_at'))
+    payload['stale'] = not collected or (_utc_now() - collected).total_seconds() > 30
+    return jsonify(payload)
 
 @app.route('/api/stats')
 def api_stats():
@@ -5430,7 +5685,7 @@ def api_models():
         headers['Authorization'] = f'Bearer {api_key}'
 
     try:
-        base_url = _compose_api_base_url()
+        base_url = _compose_api_base_url(port=CONFIG.get('cliproxy_api_port'))
         models_url = f'{base_url}/v1/models'
         with http_session.get(models_url, headers=headers, timeout=10, stream=True) as resp:
             resp.raise_for_status()
@@ -5531,7 +5786,7 @@ def api_test_api():
         safe_headers[key_text] = value_text
 
     try:
-        base_url = _compose_api_base_url()
+        base_url = _compose_api_base_url(port=CONFIG.get('cliproxy_api_port'))
         url = base_url + endpoint
         start_time = time.time()
         response = http_session.request(
@@ -5619,19 +5874,77 @@ def api_export(data_type):
     return jsonify({'error': 'Unknown data type'}), 400
 
 # 启动后台任务
-def background_tasks():
-    """后台任务：定期健康检查和资源监控"""
-    next_pricing_refresh = 0.0
-    while True:
+def redact_log_message(message):
+    text = str(message)[:16 * 1024]
+    for key in (_panel_access_key_expected(), str(CONFIG.get('management_key') or ''),
+                str(CONFIG.get('models_api_key') or '')):
+        if key:
+            text = text.replace(key, '[REDACTED]')
+    text = re.sub(r'(?i)(bearer\s+)[^\s,;"\']+', r'\1[REDACTED]', text)
+    text = re.sub(r'(?i)((?:api[_-]?key|token|password|secret)=)[^\s&"\']+', r'\1[REDACTED]', text)
+    return text
+
+
+def collect_runtime_snapshot():
+    """Only this bounded collector does work for automatic browser polling."""
+    remote = probe_upstream()
+    cache.invalidate('local_version')
+    state['current_version'] = get_local_version()
+    current_key = _release_version_key(state['current_version'])
+    latest_key = _release_version_key(state['latest_version'])
+    state['has_update'] = bool(current_key and latest_key and latest_key > current_key and not remote.get('version_stale'))
+    resources = get_system_resources()
+    resources['scope'] = get_capabilities()['resource_scope']
+    if not resources.get('error'):
+        state['resources_snapshot'] = {**resources, 'collected_at': _utc_iso()}
+    logs = merge_log_entries(
+        parse_log_file(CONFIG['cliproxy_log'], max_lines=400, limit=400),
+        parse_log_file(CONFIG['cliproxy_stderr'], max_lines=120, limit=120),
+        parse_journal_logs(CONFIG.get('cliproxy_service'), max_lines=120), limit=200,
+    )
+    for entry in logs:
+        entry['message'] = redact_log_message(entry['message'])
+    state['logs_snapshot'] = {'logs': logs, 'count': len(logs), 'collected_at': _utc_iso()}
+    state['dashboard_snapshot'] = build_status_payload()
+    state['collector_time'] = _utc_iso()
+    state['collector_error'] = None
+
+
+def collector_worker():
+    while not shutdown_event.is_set():
+        collector_wakeup.clear()
         try:
-            perform_health_check()
-            get_request_count_from_logs()
+            collect_runtime_snapshot()
+        except Exception as exc:
+            # Keep the previous sample, visibly mark it stale, and retry next cycle.
+            state['collector_error'] = f'状态采集失败 ({_error_kind(exc)})'
+        collector_wakeup.wait(5)
+
+
+def background_tasks():
+    """Slow diagnostics/pricing are isolated from the frequent state collector."""
+    next_pricing_refresh = 0.0
+    while not shutdown_event.is_set():
+        try:
+            state['health_snapshot'] = perform_health_check(use_cache=False)
+        except Exception as exc:
+            print(f'[{_utc_iso()}] Health check failed ({_error_kind(exc)})')
+        try:
             if time.monotonic() >= next_pricing_refresh:
                 get_effective_pricing(allow_remote=True)
                 next_pricing_refresh = time.monotonic() + 6 * 3600
-        except Exception as e:
-            print(f'[{_utc_iso()}] Health check failed ({_error_kind(e)})')
-        time.sleep(60)
+        except Exception as exc:
+            print(f'[{_utc_iso()}] Pricing refresh failed ({_error_kind(exc)})')
+        shutdown_event.wait(60)
+
+
+def shutdown_runtime():
+    shutdown_event.set()
+    auto_update_wakeup.set()
+    collector_wakeup.set()
+    resource_monitor._running = False
+    save_persistent_stats(force=True)
+    save_log_stats_state(force=True)
 
 
 runtime_lock = threading.Lock()
@@ -5651,16 +5964,16 @@ def initialize_runtime():
     save_persistent_stats(force=True)
     load_log_stats_state()
     resource_monitor.start()
-    atexit.register(save_persistent_stats, force=True)
-    atexit.register(save_log_stats_state, force=True)
+    atexit.register(shutdown_runtime)
 
     cliproxy_binary = _resolve_panel_path(CONFIG.get('cliproxy_binary'))
     if cliproxy_binary and os.path.lexists(cliproxy_binary):
         cliproxy_binary = os.path.realpath(cliproxy_binary)
-    if cliproxy_binary:
+    if cliproxy_binary and get_capabilities()['binary_update']:
         cleanup_binary_backups(cliproxy_binary)
 
     threads = [
+        threading.Thread(target=collector_worker, daemon=True, name='cpa-collector'),
         threading.Thread(target=auto_update_worker, daemon=True, name='cpa-auto-update'),
         threading.Thread(target=background_tasks, daemon=True, name='cpa-background'),
         threading.Thread(target=_persistent_stats_worker, daemon=True, name='cpa-stats-persist'),
@@ -5675,6 +5988,11 @@ def initialize_runtime():
             print(f'Warning: only {len(quotes)} bundled quotes were loaded')
 
 if __name__ == '__main__':
+    def handle_shutdown(_signum, _frame):
+        raise SystemExit(0)
+
+    signal.signal(signal.SIGTERM, handle_shutdown)
+    signal.signal(signal.SIGINT, handle_shutdown)
     initialize_runtime()
     bind_host = str(CONFIG.get('bind_host') or '127.0.0.1')
     panel_port = int(CONFIG['panel_port'])
@@ -5686,6 +6004,8 @@ if __name__ == '__main__':
             port=panel_port,
             threads=max(4, min(16, (os.cpu_count() or 2) * 2)),
             channel_timeout=30,
+            connection_limit=128,
+            max_request_body_size=3 * 1024 * 1024,
             clear_untrusted_proxy_headers=True,
         )
     else:

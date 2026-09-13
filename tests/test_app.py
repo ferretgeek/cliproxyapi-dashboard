@@ -375,6 +375,7 @@ def test_update_prepares_before_stopping_and_rolls_binary_back(tmp_path, monkeyp
     monkeypatch.setitem(app.CONFIG, 'backup_retention_count', 2)
     monkeypatch.setattr(app, 'is_linux', lambda: True)
     monkeypatch.setattr(app, 'command_available', lambda _name: True)
+    monkeypatch.setattr(app, 'get_capabilities', lambda: {'service_control': True, 'binary_update': True, 'config_write': True, 'mode': 'systemd', 'resource_scope': 'host', 'reason': ''})
 
     calls = []
     starts = 0
@@ -449,6 +450,7 @@ def test_update_rolls_back_when_management_endpoint_never_becomes_healthy(tmp_pa
     monkeypatch.setitem(app.CONFIG, 'cliproxy_service', 'cliproxy')
     monkeypatch.setattr(app, 'is_linux', lambda: True)
     monkeypatch.setattr(app, 'command_available', lambda _name: True)
+    monkeypatch.setattr(app, 'get_capabilities', lambda: {'service_control': True, 'binary_update': True, 'config_write': True, 'mode': 'systemd', 'resource_scope': 'host', 'reason': ''})
     monkeypatch.setattr(app, 'run_cmd', lambda *_args, **_kwargs: (True, '', ''))
 
     def fake_release(binary_path=''):
@@ -604,8 +606,12 @@ def test_frontend_is_self_contained_accessible_and_responsive():
     html = (Path(app.BASE_DIR) / 'static' / 'index.html').read_text(encoding='utf-8')
     soup = BeautifulSoup(html, 'html.parser')
     assert 'fonts.googleapis.com' not in html
-    assert '@media (max-width: 820px)' in html
-    assert 'prefers-reduced-motion' in html
+    css = (Path(app.BASE_DIR) / 'static' / 'dashboard.css').read_text(encoding='utf-8')
+    js = (Path(app.BASE_DIR) / 'static' / 'dashboard.js').read_text(encoding='utf-8')
+    assert '@media (max-width: 820px)' in css
+    assert 'prefers-reduced-motion' in css
+    assert 'backdrop-filter' not in css
+    assert 'fonts.googleapis.com' not in css
     assert all(button.get('type') for button in soup.find_all('button'))
     for control in soup.find_all(['input', 'select', 'textarea']):
         if control.get('type') == 'checkbox':
@@ -615,5 +621,8 @@ def test_frontend_is_self_contained_accessible_and_responsive():
         )
     ids = [node.get('id') for node in soup.find_all(attrs={'id': True})]
     assert len(ids) == len(set(ids))
-    assert "url.searchParams.get('panel_key')" not in html
-    assert "new URLSearchParams(url.hash" in html
+    assert "url.searchParams.get('panel_key')" not in js
+    assert "new URLSearchParams(url.hash" in js
+    client = app.app.test_client()
+    assert client.get('/dashboard.css').status_code == 200
+    assert client.get('/dashboard.js').status_code == 200

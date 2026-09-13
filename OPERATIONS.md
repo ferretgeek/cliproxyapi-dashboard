@@ -22,6 +22,36 @@ Local mode binds to `127.0.0.1:8080`. A server deployment may sit behind a rever
 - Before upgrade, back up as below, stop the process/service, obtain verified source, reinstall pinned dependencies, and restart. Never overwrite `.env` or `data/`, and never treat examples as production values.
 - Verify `/api/healthz`, authenticated `/api/health`, overview statistics, incremental logs, and service status. Auto-update succeeds only after systemd is active and the authenticated real management endpoint returns HTTP 200; failed versions back off and restore the binary backup.
 
+## Docker v2.3 部署与验收 / Container verification
+
+```bash
+cp .env.docker.example .env.docker
+# 编辑 .env.docker：填入至少 32 字符面板密钥、上游明文管理密钥及地址。
+# 上游为另一个容器时，使用同一网络的服务名，不要使用容器内的 127.0.0.1。
+docker compose --env-file .env.docker config --quiet
+docker compose --env-file .env.docker up -d --build
+curl --fail http://127.0.0.1:8080/api/healthz
+```
+
+- 上游管理接口要允许来自面板的访问（例如 `remote-management.allow-remote: true`）；用防火墙 / Docker 私有网络限制来源，不要直接公开管理端口。`host.docker.internal` 无法访问只监听宿主 `127.0.0.1` 的服务，应在受限网络上配置可达地址。
+- API 基址不带端口时使用 `_CLIPROXY_API_PORT`；显式 URL 端口优先。HTTPS 反代可填写 `https://example.internal:443`，路径前缀会保留。
+- `data/panel_settings.json` 保存面板设置和可能的明文管理密钥，权限为 0600；数据卷和备份应按秘密文件管理。非空环境变量在重启后覆盖 UI 保存值；需要由 UI 管理密钥 / 计价开关时，将对应环境变量留空。
+- 日志和上游 YAML 需要可读挂载。建议挂载整个日志目录并将 `_CLIPROXY_LOG` 指向其中的 `main.log`，避免单文件挂载在日志轮转后停留在旧 inode。
+- `unknown` 是未确认；`dev` 是上游未注入 Release 标签的开发构建；认证失败、不可达和 HTTP 错误单独显示。关闭自动升级不会停止版本检查。
+- 状态 / 资源约每 5 秒后台采集，完整健康诊断每 60 秒采集；读取 API 不触发即时慢检查。启动时允许短暂 `checking`，超过新鲜度期限会显示过期状态。
+- Docker 仅监控。面板禁止启停宿主服务和替换上游二进制；升级上游镜像请在其部署目录执行。资源采样属于面板运行环境（某些容器指标可反映宿主机），不是远程上游资源。
+
+For container deployments, use the Compose command above, provide reachable upstream networking and its **plaintext** management key, and protect the data volume. Nonempty environment variables override UI-persisted settings after restart. Mount the upstream log **directory** to observe file rotation. `dev` is a development build, not an invented release; discovery continues with auto-upgrade disabled. Status APIs serve background snapshots; diagnostics may lag by one minute. Container mode never controls the host or upgrades the upstream image.
+
+开发验收（不接触真实上游） / Developer smoke test:
+
+```bash
+docker build -t cpax-panel:ci .
+python tests/container_smoke.py
+```
+
+该测试使用真实 Docker 网络和数据卷，但上游是测试服务器；覆盖版本头、模型接口、认证、禁用宿主操作、重建保留设置、上游中断时 200 次并发读取及恢复。不能替代真实生产升级或长期压力测试。
+
 ## 备份与恢复 / Backup and restore
 
 1. 停止 CPA-X，避免复制到一半的原子状态文件。

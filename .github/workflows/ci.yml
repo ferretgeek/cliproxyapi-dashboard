@@ -52,14 +52,17 @@ jobs:
       - name: Check critical Python errors
         run: python -m ruff check --select E9,F63,F7,F82 app.py scripts tests
 
-      - name: Check inline JavaScript syntax
+      - name: Check JavaScript syntax
+        run: node --check static/dashboard.js
+
+      - name: Check static asset references
         shell: pwsh
         run: |
           $html = Get-Content -Raw -LiteralPath static/index.html
-          $match = [regex]::Match($html, '(?s)<script>(.*?)</script>')
-          if (-not $match.Success) { throw 'No inline script found in static/index.html' }
-          Set-Content -LiteralPath inline-script.js -Value $match.Groups[1].Value -Encoding utf8
-          node --check inline-script.js
+          foreach ($asset in @('dashboard.css', 'dashboard.js')) {
+            if (-not (Test-Path (Join-Path static $asset))) { throw "Missing static/$asset" }
+            if ($html -notmatch [regex]::Escape("/$asset")) { throw "index.html does not reference /$asset" }
+          }
 
       - name: Scan for high-severity Python issues
         if: runner.os == 'Linux' && matrix.python-version == '3.13'
@@ -80,3 +83,7 @@ jobs:
 
       - name: Build image
         run: docker build --tag cpax-panel:ci .
+
+      - name: Test container networking, persistence and outage recovery
+        timeout-minutes: 8
+        run: python3 tests/container_smoke.py

@@ -6,6 +6,9 @@ CPA-X 遵循语义化版本。详细说明和可下载发行包统一发布在 G
 
 ## Unreleased
 
+- v2.3 reliability pass: Docker configuration propagation and persistent panel settings; bounded background snapshots; explicit remote/container capability boundaries; version discovery from CLIProxyAPI build headers; log scan budgets and rotation handling; and a no-blur responsive dashboard with scroll-safe incremental log rendering.
+- v2.3 稳定性升级：补齐 Docker 配置透传与面板设置持久化；后台快照与资源边界；读取 CLIProxyAPI 构建响应头；日志扫描预算与轮转处理；以及取消昂贵模糊效果、支持正常滚动和增量日志渲染的新面板。
+
 - Raise the development test floor to `pytest 9.0.3` and bootstrap `pip 26.1.2+` so fresh local and CI environments avoid currently known toolchain vulnerabilities.
 - 将开发测试下限提升到 `pytest 9.0.3`，并在本地与 CI 安装流程中先升级到 `pip 26.1.2+`，避免已知工具链漏洞。
 - Harden loopback Host validation and browser mutation checks, move one-time panel-key setup from query strings to URL fragments, and stage Linux systemd runtime files in a root-owned release directory.
