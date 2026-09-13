@@ -36,7 +36,7 @@ from requests.adapters import HTTPAdapter
 
 # 面板自身版本（与 GitHub Release/README 同步）
 PANEL_NAME = "CPA-X"
-PANEL_VERSION = "2.3.0"
+PANEL_VERSION = "2.3.1"
 PRICING_BASIS_TOKENS = 1_000_000
 PRICING_BASIS_LABEL = '百万Tokens'
 PRICING_BASIS_TEXT = f'美元/{PRICING_BASIS_LABEL}'

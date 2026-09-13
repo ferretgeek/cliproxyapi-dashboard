@@ -4,6 +4,11 @@ CPA-X follows semantic versioning. Detailed notes and downloadable packages are 
 
 CPA-X 遵循语义化版本。详细说明和可下载发行包统一发布在 GitHub Releases 页面。
 
+## [2.3.1] - 2026-09-13
+
+- Fix reverse-proxy subpath asset/API resolution; add coordinated SVG/ICO/Apple bookmark icons.
+- 修复 `/cpax/` 等子路径的资源与 API 寻址，统一收藏夹和移动端图标。[完整说明](RELEASE_NOTES_v2.3.1.md)
+
 ## [2.3.0] - 2026-09-13
 
 [Release notes / 完整说明](RELEASE_NOTES_v2.3.0.md)

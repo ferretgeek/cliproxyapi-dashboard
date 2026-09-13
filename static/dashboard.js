@@ -1,5 +1,6 @@
 
-        const API = '';
+        // Resolve against this script, not the domain root: works at / and /cpax/.
+        const API = new URL('.', document.currentScript.src).pathname.replace(/\/$/, '');
         const inflight = {
             refreshStatus: false,
             refreshResources: false,

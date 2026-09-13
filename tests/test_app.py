@@ -626,3 +626,13 @@ def test_frontend_is_self_contained_accessible_and_responsive():
     client = app.app.test_client()
     assert client.get('/dashboard.css').status_code == 200
     assert client.get('/dashboard.js').status_code == 200
+    assert client.get('/favicon.svg').status_code == 200
+    assert client.get('/favicon.ico').status_code == 200
+    assert client.get('/apple-touch-icon.png').status_code == 200
+    from urllib.parse import urljoin
+    for prefix in ['https://example.test/', 'https://example.test/cpax/']:
+        for node in soup.select('link[href], script[src]'):
+            url = node.get('href') or node.get('src')
+            assert url.startswith('./')
+            assert urljoin(prefix, url).startswith(prefix)
+    assert "new URL('.', document.currentScript.src)" in js
