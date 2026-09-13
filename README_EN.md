@@ -8,7 +8,7 @@ View [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) service status 
 
 [Install](#running-it) · [Operations guide](OPERATIONS.md) · [Screenshots](#interface)
 
-Live request counts come from logs. Token and cost data come from existing local history snapshots; current CLIProxyAPI versions no longer provide the legacy usage API.
+Live request counts come from logs. Token and cost data come from existing local history snapshots; current CLIProxyAPI versions no longer provide the legacy usage API. v2.3 serves background snapshots and explicitly separates Docker/remote monitoring from host service control.
 
 ## Interface
 
@@ -16,19 +16,21 @@ Live request counts come from logs. Token and cost data come from existing local
 |---|---|
 | ![Dark theme](docs/images/preview-dark.png) | ![Light theme](docs/images/preview-light.png) |
 
+Screenshots use a local simulated upstream, not production service or benchmark data.
+
 <p align="center">
   <img src="docs/images/preview-mobile.png" alt="Mobile layout" width="320" />
 </p>
 
 ## What it does
 
-- **Status** — whether the service is up, CPU / memory / disk, upstream vs. local version, per-account availability.
-- **Usage and cost** — live request volume comes from logs. Existing token and cost history is read from local compatibility snapshots, with model and account breakdowns. Estimated pricing can auto-sync from OpenRouter or be entered manually with sync turned off.
-- **Logs** — incrementally parsed, filterable by level and keyword, so you don't SSH in to `tail`.
+- **Status** — whether the service is up, CPU / memory / disk, current upstream build vs. latest release, and connection diagnostics.
+- **Usage and cost** — live request volume comes from logs. Existing token and cost history is read from local compatibility snapshots, with historical totals in the dashboard. Estimated pricing can auto-sync from OpenRouter or be entered manually with sync turned off.
+- **Logs** — incrementally parsed, with error highlighting and keyword filtering, so you don't SSH in to `tail`.
 - **Upgrades** — check, download, verify, replace, restart, health-confirm, and roll back on failure.
 - **Service control** — start, stop, and restart the systemd unit on Linux. Under Windows and Docker this is explicitly disabled rather than silently pretending to work.
 - **Config** — read-only and validate-only by default. Writing back to the main config is something you have to turn on yourself.
-- **Themes** — Sky, Mint, Rose, and Sand light palettes plus a `#17191d` deep-gray dark mode, switchable from the top right and remembered. Phone layouts are fully usable, not merely reachable.
+- **Themes** — Sky, Mint, Rose, and Sand light palettes plus a blue-gray dark mode, switchable from the top right and remembered. Phone layouts are fully usable, not merely reachable.
 
 ## Running it
 
@@ -91,7 +93,7 @@ Key variables (all documented inline in `.env.example`):
 
 <br />
 
-Containers usually lack systemd and host privileges, so **auto-update and service control are unavailable under Docker**. Status, statistics, models, logs, and config reads all work normally.
+Containers usually lack systemd and host privileges, so **auto-update and service control are unavailable under Docker**. Monitoring uses the reachable management API; logs and config reads require read-only mounts. Compose passes upstream keys and API addresses and persists panel settings in `data/`. Version discovery still works with upgrades disabled; an upstream `dev` build is shown honestly as a development build.
 
 ```bash
 cp .env.docker.example .env.docker
@@ -107,7 +109,7 @@ Compose publishes the host port on `127.0.0.1` by default and refuses to start w
 
 **Upgrades can't report a fake success.** This is the part that got the most attention, prompted by an intermittent `502` in production. The flow is now: prepare online → verify SHA-256 → atomic replacement → restart → **actually call the authenticated management endpoint and require HTTP 200** before declaring success. A failed version enters durable exponential backoff that survives a panel restart, and rolls back to the last known-good build. Anonymous GitHub version checks prefer stable release redirects to avoid tripping rate limits.
 
-**Logs are parsed incrementally.** The whole file is never re-read, so memory and CPU stay flat over long runs. State is persisted with atomic writes, upstream outages back off and retry, and backups are capped by count, age, and size.
+**Logs are parsed incrementally.** A bounded incremental scan avoids re-reading the entire file on every refresh, with per-cycle byte/time budgets and bounded tail reads. State is persisted with atomic writes, upstream outages back off and retry, and backups are capped by count, age, and size.
 
 **Time zones are inferred, not guessed.** CLIProxyAPI log timestamps may carry no offset, and host and container zones can disagree. The panel reconstructs the correct instant, emits UTC / RFC 3339 from every API, and renders in whichever zone you configure.
 
